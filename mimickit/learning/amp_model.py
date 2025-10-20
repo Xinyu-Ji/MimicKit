@@ -30,7 +30,7 @@ class AMPModel(ppo_model.PPOModel):
         super()._build_nets(config, env)
         self._build_disc(config, env)
         return
-
+#判别器
     def _build_disc(self, config, env):
         net_name = config["disc_net"]
         init_output_scale = config["disc_init_output_scale"]

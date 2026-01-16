@@ -3,12 +3,14 @@ import envs.char_env as char_env
 import numpy as np
 import torch
 
+import engines.engine as engine
+
 class CharDofTestEnv(char_env.CharEnv):
-    def __init__(self, config, num_envs, device, visualize):
+    def __init__(self, env_config, engine_config, num_envs, device, visualize):
         self._time_per_dof = 4.0
 
-        super().__init__(config=config, num_envs=num_envs, device=device,
-                         visualize=visualize)
+        super().__init__(env_config=env_config, engine_config=engine_config,
+                         num_envs=num_envs, device=device, visualize=visualize)
 
         self._episode_length = self._time_per_dof * self._pd_low.shape[0]
         return
@@ -28,15 +30,12 @@ class CharDofTestEnv(char_env.CharEnv):
         return
 
     def _calc_test_action(self, actions):
-        test_actions = torch.zeros_like(actions)
-
-        num_envs = self._engine.get_num_envs()
         num_dofs = self._pd_low.shape[0]
-        env_ids = torch.arange(num_envs, device=self._device, dtype=torch.long)
+        test_actions = torch.zeros_like(actions)
 
         phase = self._time_buf / self._time_per_dof
         dof_id = phase.type(torch.long)
-        dof_id = dof_id + env_ids
+        dof_id = dof_id + self._env_ids
         dof_id = torch.remainder(dof_id, num_dofs)
 
         curr_low = self._pd_low[dof_id]
@@ -52,20 +51,15 @@ class CharDofTestEnv(char_env.CharEnv):
 
         return test_actions
     
-    def _ig_load_char_asset(self, config):
-        char_file = config["env"]["char_file"]
-        self._char_asset = self._engine.load_asset(char_file, fix_base=True)
-        return
-
-    def _ig_build_character(self, env_id, config, color=None):
-        col_group = env_id
-        col_filter = 1
-        segmentation_id = 0
-        char_id = self._engine.create_actor(env_id=env_id, 
-                                             asset=self._char_asset,
-                                             name="character", 
-                                             col_group=col_group, 
-                                             col_filter=col_filter, 
-                                             segmentation_id=segmentation_id,
-                                             color=color)
+    def _build_character(self, env_id, env_config, color=None):
+        char_file = env_config["char_file"]
+        char_id = self._engine.create_obj(env_id=env_id, 
+                                          obj_type=engine.ObjType.articulated,
+                                          asset_file=char_file,
+                                          name="character",
+                                          start_pos=self._init_root_pos.cpu().numpy(),
+                                          start_rot=self._init_root_rot.cpu().numpy(),
+                                          enable_self_collisions=False,
+                                          fix_root=True,
+                                          color=color)
         return char_id

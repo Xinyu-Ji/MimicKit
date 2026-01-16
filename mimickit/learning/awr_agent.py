@@ -9,8 +9,6 @@ import util.mp_util as mp_util
 import util.torch_util as torch_util
 
 class AWRAgent(base_agent.BaseAgent):
-    NAME = "AWR"
-
     def __init__(self, config, env, device):
         super().__init__(config, env, device)
         return
@@ -35,7 +33,6 @@ class AWRAgent(base_agent.BaseAgent):
         self._exp_anneal_samples = config.get("exp_anneal_samples", np.inf)
         self._exp_prob_beg = config.get("exp_prob_beg", 1.0)
         self._exp_prob_end = config.get("exp_prob_end", 1.0)
-        
         return
 
     def _build_model(self, config):
@@ -45,23 +42,6 @@ class AWRAgent(base_agent.BaseAgent):
     
     def _get_exp_buffer_length(self):
         return self._steps_per_iter
-
-    def _build_exp_buffer(self, config):
-        super()._build_exp_buffer(config)
-        
-        buffer_length = self._get_exp_buffer_length()
-        batch_size = self.get_num_envs()
-        
-        tar_val_buffer = torch.zeros([buffer_length, batch_size], device=self._device, dtype=torch.float)
-        self._exp_buffer.add_buffer("tar_val", tar_val_buffer)
-        
-        a_weight_buffer = torch.zeros([buffer_length, batch_size], device=self._device, dtype=torch.float)
-        self._exp_buffer.add_buffer("a_weight", a_weight_buffer)
-        
-        rand_action_mask_buffer = torch.zeros([buffer_length, batch_size], device=self._device, dtype=torch.float)
-        self._exp_buffer.add_buffer("rand_action_mask", rand_action_mask_buffer)
-        
-        return
     
     def _init_iter(self):
         super()._init_iter()

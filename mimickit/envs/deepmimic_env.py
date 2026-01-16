@@ -5,14 +5,13 @@ import anim.motion as motion
 import anim.motion_lib as motion_lib
 import envs.base_env as base_env
 import envs.char_env as char_env
+import engines.engine as engine
 import util.stats_tracker as stats_tracker
 import util.torch_util as torch_util
 
 class DeepMimicEnv(char_env.CharEnv):
-    def __init__(self, config, num_envs, device, visualize):
-        env_config = config["env"]
+    def __init__(self, env_config, engine_config, num_envs, device, visualize):
         self._enable_early_termination = env_config["enable_early_termination"]
-        self._termination_height = env_config["termination_height"]
         self._num_phase_encoding = env_config.get("num_phase_encoding", 0)
 
         self._pose_termination = env_config.get("pose_termination", False)
@@ -40,9 +39,8 @@ class DeepMimicEnv(char_env.CharEnv):
         
         self._visualize_ref_char = env_config.get("visualize_ref_char", True)
         
-        super().__init__(config=config, num_envs=num_envs, device=device,
-                         visualize=visualize)
-        
+        super().__init__(env_config=env_config, engine_config=engine_config,
+                         num_envs=num_envs, device=device, visualize=visualize)
         return
     
     def get_reward_succ(self):
@@ -59,11 +57,10 @@ class DeepMimicEnv(char_env.CharEnv):
         if (self._mode == base_env.EnvMode.TEST):
             if (self._log_tracking_error):
                 self._error_tracker.reset()
-
         return
 
-    def _build_sim_tensors(self, config):
-        super()._build_sim_tensors(config)
+    def _build_sim_tensors(self, env_config):
+        super()._build_sim_tensors(env_config)
         
         num_envs = self.get_num_envs()
         self._motion_ids = torch.zeros(num_envs, device=self._device, dtype=torch.int64)
@@ -84,17 +81,16 @@ class DeepMimicEnv(char_env.CharEnv):
         self._ref_root_vel = torch.zeros_like(root_vel)
         self._ref_root_ang_vel = torch.zeros_like(root_ang_vel)
         self._ref_body_pos = torch.zeros_like(body_pos)
+        self._ref_body_rot = torch.zeros_like(body_rot)
         self._ref_joint_rot = torch.zeros_like(body_rot[..., 1:, :])
         self._ref_dof_pos = torch.zeros_like(dof_pos) 
         self._ref_dof_vel = torch.zeros_like(dof_vel)
-  
-        env_config = config["env"]
+        
         contact_bodies = env_config.get("contact_bodies", [])
         self._contact_body_ids = self._build_body_ids_tensor(contact_bodies)
 
         joint_err_w = env_config.get("joint_err_w", None)
         self._parse_joint_err_weights(joint_err_w)
-        
         return
 
     def _load_motions(self, motion_file):
@@ -122,14 +118,20 @@ class DeepMimicEnv(char_env.CharEnv):
                 curr_w = self._joint_err_w[j - 1]
                 dof_idx = self._kin_char_model.get_joint_dof_idx(j)
                 self._dof_err_w[dof_idx:dof_idx + dof_dim] = curr_w
-
         return
     
     def _enable_ref_char(self):
         return self._visualize and self._visualize_ref_char
 
     def _get_ref_char_color(self):
-        return np.array([0.5, 0.9, 0.1])
+        engine_name = self._engine.get_name()
+        if (engine_name == "isaac_lab"):
+            col = np.array([0.25, 0.4, 0.1])
+        elif (engine_name == "newton"):
+            col = np.array([0.3, 0.5, 0.1])
+        else:
+            col = np.array([0.5, 0.9, 0.1])
+        return col
 
     def _reset_char(self, env_ids):
         self._reset_ref_motion(env_ids)
@@ -137,7 +139,6 @@ class DeepMimicEnv(char_env.CharEnv):
 
         if (self._enable_ref_char()):
             self._reset_ref_char(env_ids)
-
         return
 
     def _reset_ref_char(self, env_ids):
@@ -171,13 +172,13 @@ class DeepMimicEnv(char_env.CharEnv):
         self._ref_joint_rot[env_ids] = joint_rot
         self._ref_dof_vel[env_ids] = dof_vel
         
-        ref_body_pos, _ = self._kin_char_model.forward_kinematics(self._ref_root_pos, self._ref_root_rot,
-                                                                                 self._ref_joint_rot)
+        ref_body_pos, ref_body_rot = self._kin_char_model.forward_kinematics(self._ref_root_pos, self._ref_root_rot,
+                                                                             self._ref_joint_rot)
         self._ref_body_pos[:] = ref_body_pos
+        self._ref_body_rot[:] = ref_body_rot
 
         dof_pos = self._motion_lib.joint_rot_to_dof(joint_rot)
         self._ref_dof_pos[env_ids] = dof_pos
-
         return
 
     def _get_ref_char_id(self):
@@ -196,7 +197,6 @@ class DeepMimicEnv(char_env.CharEnv):
         
         self._engine.set_body_vel(env_ids, char_id, 0.0)
         self._engine.set_body_ang_vel(env_ids, char_id, 0.0)
-
         return
 
     def _get_motion_times(self, env_ids=None):
@@ -212,7 +212,6 @@ class DeepMimicEnv(char_env.CharEnv):
 
         if (self._enable_ref_char()):
             self._update_ref_char()
-        
         return
     
     def _update_ref_motion(self):
@@ -227,20 +226,22 @@ class DeepMimicEnv(char_env.CharEnv):
         self._ref_joint_rot[:] = joint_rot
         self._ref_dof_vel[:] = dof_vel
 
-        ref_body_pos, _ = self._kin_char_model.forward_kinematics(self._ref_root_pos, self._ref_root_rot,
-                                                                                 self._ref_joint_rot)
+        ref_body_pos, ref_body_rot = self._kin_char_model.forward_kinematics(self._ref_root_pos, self._ref_root_rot,
+                                                                             self._ref_joint_rot)
         self._ref_body_pos[:] = ref_body_pos
+        self._ref_body_rot[:] = ref_body_rot
 
         if (self._enable_ref_char()):
             dof_pos = self._motion_lib.joint_rot_to_dof(joint_rot)
             self._ref_dof_pos[:] = dof_pos
-
         return
 
     def _update_ref_char(self):
         ref_char_id = self._get_ref_char_id()
 
         root_pos = self._ref_root_pos + self._ref_char_offset
+        body_pos = self._ref_body_pos + self._ref_char_offset
+
         self._engine.set_root_pos(None, ref_char_id, root_pos)
         self._engine.set_root_rot(None, ref_char_id, self._ref_root_rot)
         self._engine.set_root_vel(None, ref_char_id, 0.0)
@@ -248,7 +249,9 @@ class DeepMimicEnv(char_env.CharEnv):
         
         self._engine.set_dof_pos(None, ref_char_id, self._ref_dof_pos)
         self._engine.set_dof_vel(None, ref_char_id, 0.0)
-        
+
+        self._engine.set_body_pos(None, ref_char_id, body_pos)
+        self._engine.set_body_rot(None, ref_char_id, self._ref_body_rot)
         self._engine.set_body_vel(None, ref_char_id, 0.0)
         self._engine.set_body_ang_vel(None, ref_char_id, 0.0)
         return
@@ -272,9 +275,44 @@ class DeepMimicEnv(char_env.CharEnv):
         if (self._log_tracking_error):
             num_track_errors = 7
             self._error_tracker = stats_tracker.StatsTracker(num_track_errors, device=self._device)
-
         return
     
+    def _build_envs(self, env_config, num_envs):
+        self._ref_char_ids = []
+
+        super()._build_envs(env_config, num_envs)
+
+        motion_file = env_config["motion_file"]
+        self._load_motions(motion_file)
+        return
+    
+    def _build_env(self, env_id, config):
+        super()._build_env(env_id, config)
+
+        if (self._enable_ref_char()):
+            ref_char_col = self._get_ref_char_color()
+            ref_char_id = self._build_ref_character(env_id, config, color=ref_char_col)
+            self._ref_char_ids.append(ref_char_id)
+            
+            if (env_id == 0):
+                self._ref_char_ids.append(ref_char_id)
+            else:
+                ref_char_id0 = self._ref_char_ids[0]
+                assert(ref_char_id0 == ref_char_id)
+        return 
+    
+    def _build_ref_character(self, env_id, env_config, color):
+        char_file = env_config["char_file"]
+        char_id = self._engine.create_obj(env_id=env_id, 
+                                          obj_type=engine.ObjType.articulated,
+                                          asset_file=char_file, 
+                                          name="ref_character",
+                                          is_visual=True,
+                                          enable_self_collisions=False,
+                                          disable_motors=True,
+                                          color=color)
+        return char_id
+
     def _compute_obs(self, env_ids=None):
         motion_ids = self._motion_ids
         motion_times = self._get_motion_times(env_ids)
@@ -286,6 +324,7 @@ class DeepMimicEnv(char_env.CharEnv):
         root_ang_vel = self._engine.get_root_ang_vel(char_id)
         dof_pos = self._engine.get_dof_pos(char_id)
         dof_vel = self._engine.get_dof_vel(char_id)
+        body_pos = self._engine.get_body_pos(char_id)
 
         if (env_ids is not None):
             root_pos = root_pos[env_ids]
@@ -294,6 +333,7 @@ class DeepMimicEnv(char_env.CharEnv):
             root_ang_vel = root_ang_vel[env_ids]
             dof_pos = dof_pos[env_ids]
             dof_vel = dof_vel[env_ids]
+            body_pos = body_pos[env_ids]
 
             motion_ids = motion_ids[env_ids]
             
@@ -305,7 +345,6 @@ class DeepMimicEnv(char_env.CharEnv):
             motion_phase = torch.zeros([0], device=self._device)
 
         if (self._has_key_bodies()):
-            body_pos, _ = self._kin_char_model.forward_kinematics(root_pos, root_rot, joint_rot)
             key_pos = body_pos[..., self._key_body_ids, :]
         else:
             key_pos = torch.zeros([0], device=self._device)
@@ -418,7 +457,7 @@ class DeepMimicEnv(char_env.CharEnv):
         char_id = self._get_char_id()
         root_rot = self._engine.get_root_rot(char_id)
         body_pos = self._engine.get_body_pos(char_id)
-        contact_forces = self._engine.get_contact_forces(char_id)
+        ground_contact_forces = self._engine.get_ground_contact_forces(char_id)
 
         self._done_buf[:] = compute_done(done_buf=self._done_buf,
                                          time=self._time_buf, 
@@ -427,9 +466,8 @@ class DeepMimicEnv(char_env.CharEnv):
                                          body_pos=body_pos,
                                          tar_root_rot=self._ref_root_rot,
                                          tar_body_pos=self._ref_body_pos,
-                                         contact_force=contact_forces,
+                                         ground_contact_force=ground_contact_forces,
                                          contact_body_ids=self._contact_body_ids,
-                                         termination_heights=self._termination_height,
                                          pose_termination=self._pose_termination,
                                          pose_termination_dist=self._pose_termination_dist,
                                          global_obs=self._global_obs,
@@ -446,7 +484,6 @@ class DeepMimicEnv(char_env.CharEnv):
         if (self._mode == base_env.EnvMode.TEST):
             if (self._log_tracking_error):
                 self._record_tracking_error(env_ids)
-
         return
     
     def _record_tracking_error(self, env_ids=None):
@@ -459,6 +496,7 @@ class DeepMimicEnv(char_env.CharEnv):
             dof_pos = self._engine.get_dof_pos(char_id)
             dof_vel = self._engine.get_dof_vel(char_id)
             body_pos = self._engine.get_body_pos(char_id)
+            body_rot = self._engine.get_body_rot(char_id)
 
             joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
 
@@ -476,6 +514,8 @@ class DeepMimicEnv(char_env.CharEnv):
                 root_vel = root_vel[env_ids]
                 root_ang_vel = root_ang_vel[env_ids]
                 dof_vel = dof_vel[env_ids]
+                body_pos = body_pos[env_ids]
+                body_rot = body_rot[env_ids]
 
                 ref_root_pos = ref_root_pos[env_ids]
                 ref_root_rot = ref_root_rot[env_ids]
@@ -483,8 +523,7 @@ class DeepMimicEnv(char_env.CharEnv):
                 ref_root_vel = ref_root_vel[env_ids]
                 ref_root_ang_vel = ref_root_ang_vel[env_ids]
                 ref_dof_vel = ref_dof_vel[env_ids]
-
-            body_pos, body_rot = self._kin_char_model.forward_kinematics(root_pos, root_rot, joint_rot)
+            
             ref_body_pos, ref_body_rot = self._kin_char_model.forward_kinematics(ref_root_pos, ref_root_rot, ref_joint_rot)
 
             tracking_error = compute_tracking_error(root_pos=root_pos,
@@ -514,7 +553,6 @@ class DeepMimicEnv(char_env.CharEnv):
             self._diagnostics["dof_vel_err"] = err_stats[4]
             self._diagnostics["root_vel_err"] = err_stats[5]
             self._diagnostics["root_ang_vel_err"] = err_stats[6]
-
         return
     
     def _fetch_tar_obs_data(self, motion_ids, motion_times):
@@ -534,70 +572,10 @@ class DeepMimicEnv(char_env.CharEnv):
         root_pos = root_pos.reshape([n, num_steps, root_pos.shape[-1]])
         root_rot = root_rot.reshape([n, num_steps, root_rot.shape[-1]])
         joint_rot = joint_rot.reshape([n, num_steps, joint_rot.shape[-2], joint_rot.shape[-1]])
+
         return root_pos, root_rot, joint_rot
 
 
-    
-    ######################
-    # Isaac Gym Builders
-    ######################
-
-    def _ig_build_envs(self, config, num_envs):
-        self._ref_char_ids = []
-
-        super()._ig_build_envs(config, num_envs)
-
-        motion_file = config["env"]["motion_file"]
-        self._load_motions(motion_file)
-        return
-
-    def _ig_build_env(self, env_id, config):
-        super()._ig_build_env(env_id, config)
-
-        if (self._enable_ref_char()):
-            ref_char_col = self._get_ref_char_color()
-            ref_char_id = self._ig_build_ref_character(env_id, config, color=ref_char_col)
-            self._ref_char_ids.append(ref_char_id)
-            
-            if (env_id == 0):
-                self._ref_char_ids.append(ref_char_id)
-            else:
-                ref_char_id0 = self._ref_char_ids[0]
-                assert(ref_char_id0 == ref_char_id)
-        
-        return 
-    
-    def _ig_build_character(self, env_id, config, color=None):
-        col_group = env_id
-        col_filter = 0
-        segmentation_id = 0
-        char_id = self._engine.create_actor(env_id=env_id, 
-                                             asset=self._char_asset, 
-                                             name="character", 
-                                             col_group=col_group, 
-                                             col_filter=col_filter,
-                                             segmentation_id=segmentation_id,
-                                             color=color)
-        return char_id
-    
-    def _ig_build_ref_character(self, env_id, config, color):
-        vis_col_group = self.get_num_envs()
-        col_group = vis_col_group + env_id
-        col_filter = 1
-        segmentation_id = 0
-        char_id = self._engine.create_actor(env_id=env_id, 
-                                             asset=self._char_asset, 
-                                             name="ref_character", 
-                                             col_group=col_group, 
-                                             col_filter=col_filter, 
-                                             segmentation_id=segmentation_id,
-                                             disable_motors=True,
-                                             color=color)
-        return char_id
-    
-
-
-    
 @torch.jit.script
 def compute_phase_obs(phase, num_phase_encoding):
     # type: (Tensor, int) -> Tensor
@@ -739,12 +717,12 @@ def compute_deepmimic_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot,
 
 @torch.jit.script
 def compute_done(done_buf, time, ep_len, root_rot, body_pos, tar_root_rot, tar_body_pos, 
-                 contact_force, contact_body_ids, termination_heights,
+                 ground_contact_force, contact_body_ids,
                  pose_termination, pose_termination_dist, 
                  global_obs, enable_early_termination,
                  motion_times, motion_len, motion_len_term,
                  track_root):
-    # type: (Tensor, Tensor, float, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, bool, float, bool, bool, Tensor, Tensor, Tensor, bool) -> Tensor
+    # type: (Tensor, Tensor, float, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, float, bool, bool, Tensor, Tensor, Tensor, bool) -> Tensor
     done = torch.full_like(done_buf, base_env.DoneFlags.NULL.value)
     
     timeout = time >= ep_len
@@ -758,15 +736,10 @@ def compute_done(done_buf, time, ep_len, root_rot, body_pos, tar_root_rot, tar_b
         failed = torch.zeros(done.shape, device=done.device, dtype=torch.bool)
 
         if (contact_body_ids.shape[0] > 0):
-            masked_contact_buf = contact_force.detach().clone()
+            masked_contact_buf = ground_contact_force.detach().clone()
             masked_contact_buf[:, contact_body_ids, :] = 0
             fall_contact = torch.any(torch.abs(masked_contact_buf) > 0.1, dim=-1)
 
-            body_height = body_pos[..., 2]
-            fall_height = body_height < termination_heights
-            fall_height[:, contact_body_ids] = False
-
-            fall_contact = torch.logical_and(fall_contact, fall_height)
             has_fallen = torch.any(fall_contact, dim=-1)
             failed = torch.logical_or(failed, has_fallen)
 
@@ -901,4 +874,5 @@ def compute_tracking_error(root_pos, root_rot, body_rot, body_pos,
     root_ang_vel_err = torch.mean(torch.abs(root_ang_vel_diff), dim=-1)
 
     tracking_error = torch.stack([root_pos_err, root_rot_err, body_pos_err, body_rot_err, dof_vel_err, root_vel_err, root_ang_vel_err], dim=-1)
+    
     return tracking_error

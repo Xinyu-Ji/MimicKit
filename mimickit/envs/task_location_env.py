@@ -1,19 +1,19 @@
 import numpy as np
 import torch
 
+import engines.engine as engine
 import envs.amp_env as amp_env
 import util.torch_util as torch_util
 
 class TaskLocationEnv(amp_env.AMPEnv):
-    def __init__(self, config, num_envs, device, visualize):
-        env_config = config["env"]
+    def __init__(self, env_config, engine_config, num_envs, device, visualize):
         self._tar_speed = env_config["tar_speed"]
         self._tar_change_time_min = env_config["tar_change_time_min"]
         self._tar_change_time_max = env_config["tar_change_time_max"]
         self._tar_dist_max = env_config["tar_dist_max"]
 
-        super().__init__(config=config, num_envs=num_envs, device=device, visualize=visualize)
-        
+        super().__init__(env_config=env_config, engine_config=engine_config,
+                         num_envs=num_envs, device=device, visualize=visualize)
         return
     
     def _build_envs(self, config, num_envs):
@@ -22,6 +22,32 @@ class TaskLocationEnv(amp_env.AMPEnv):
 
         super()._build_envs(config, num_envs)
         return
+    
+    def _build_env(self, env_id, config):
+        super()._build_env(env_id, config)
+        
+        if (self._visualize):
+            marker_id = self._build_marker(env_id)
+
+            if (env_id == 0):
+                self._marker_ids.append(marker_id)
+            else:
+                marker_id0 = self._marker_ids[0]
+                assert(marker_id0 == marker_id)
+        return
+
+    def _build_marker(self, env_id):
+        asset_file = "data/assets/objects/location_marker.xml"
+
+        marker_id = self._engine.create_obj(env_id=env_id, 
+                                            obj_type=engine.ObjType.rigid,
+                                            asset_file=asset_file, 
+                                            name="marker",
+                                            is_visual=True,
+                                            fix_root=True,
+                                            color=[0.8, 0.0, 0.0])
+        
+        return marker_id
 
     def _build_sim_tensors(self, config):
         super()._build_sim_tensors(config)
@@ -30,7 +56,6 @@ class TaskLocationEnv(amp_env.AMPEnv):
         self._tar_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
         self._tar_change_times = torch.zeros([num_envs], device=self._device, dtype=torch.float)
         self._prev_root_pos = torch.zeros([num_envs, 3], device=self._device, dtype=torch.float)
-        
         return
     
     def _get_marker_id(self):
@@ -63,7 +88,6 @@ class TaskLocationEnv(amp_env.AMPEnv):
 
         if len(rest_env_ids) > 0:
             self._reset_task(rest_env_ids)
-
         return
 
     def _reset_envs(self, env_ids):
@@ -74,6 +98,17 @@ class TaskLocationEnv(amp_env.AMPEnv):
         return
 
     def _reset_task(self, env_ids):
+        self._reset_tar(env_ids)
+
+        rand_dt = torch.rand(env_ids.shape[0], device=self._device, dtype=torch.float)
+        rand_dt = (self._tar_change_time_max - self._tar_change_time_min) * rand_dt + self._tar_change_time_min
+        self._tar_change_times[env_ids] = self._time_buf[env_ids] + rand_dt
+        
+        if (self._visualize):
+            self._update_marker(env_ids)
+        return
+    
+    def _reset_tar(self, env_ids):
         char_id = self._get_char_id()
         root_pos = self._engine.get_root_pos(char_id)
 
@@ -85,15 +120,7 @@ class TaskLocationEnv(amp_env.AMPEnv):
         rand_pos[..., 0] += rand_dist * torch.cos(rand_theta)
         rand_pos[..., 1] += rand_dist * torch.sin(rand_theta)
 
-        rand_dt = torch.rand_like(char_root_pos[..., 0])
-        rand_dt = (self._tar_change_time_max - self._tar_change_time_min) * rand_dt + self._tar_change_time_min
-
         self._tar_pos[env_ids, 0:2] = rand_pos
-        self._tar_change_times[env_ids] = self._time_buf[env_ids] + rand_dt
-        
-        if (self._visualize):
-            self._update_marker(env_ids)
-
         return
 
     def _compute_obs(self, env_ids=None):
@@ -133,72 +160,28 @@ class TaskLocationEnv(amp_env.AMPEnv):
         self._update_task()
         return
 
-    def _render(self):
-        super()._render()
-        self._render_location()
+    def _render_scene(self):
+        super()._render_scene()
+        self._render_location_lines()
         return
 
-    def _render_location(self):
-        cols = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+    def _render_location_lines(self):
+        line_width = 2.0
+        col = np.array([[1.0, 0.0, 0.0, 0.5]], dtype=np.float32)
         
         char_id = self._get_char_id()
         char_root_pos = self._engine.get_root_pos(char_id)
 
-        starts = char_root_pos[..., 0:3]
-        ends = self._tar_pos
-        verts = torch.cat([starts, ends], dim=-1).cpu().numpy()
+        starts = char_root_pos.cpu().numpy()
+        ends = self._tar_pos.cpu().numpy()
         
         num_envs = self.get_num_envs()
         for i in range(num_envs):
-            curr_verts = verts[i]
-            curr_verts = curr_verts.reshape([1, 6])
-            self._engine.draw_lines(i, curr_verts, cols)
+            curr_start = starts[i:i + 1]
+            curr_end = ends[i:i + 1]
+            self._engine.draw_lines(i, curr_start, curr_end, col, line_width)
 
         return
-    
-
-    ######################
-    # Isaac Gym Builders
-    ######################
-
-    def _ig_load_char_asset(self, config):
-        super()._ig_load_char_asset(config)
-        if (self._visualize):
-            self._ig_load_marker_asset()
-        return
-
-    def _ig_load_marker_asset(self):
-        asset_file = "data/assets/location_marker.urdf"
-        self._marker_asset = self._engine.load_asset(asset_file, fix_base=True)
-        return
-
-    def _ig_build_env(self, env_id, config):
-        super()._ig_build_env(env_id, config)
-        
-        if (self._visualize):
-            marker_id = self._ig_build_marker(env_id)
-
-            if (env_id == 0):
-                self._marker_ids.append(marker_id)
-            else:
-                marker_id0 = self._marker_ids[0]
-                assert(marker_id0 == marker_id)
-
-        return
-
-    def _ig_build_marker(self, env_id):
-        col_group = self.get_num_envs()
-        col_filter = 0
-        segmentation_id = 0
-        marker_id = self._engine.create_actor(env_id=env_id, 
-                                             asset=self._marker_asset, 
-                                             name="marker", 
-                                             col_group=col_group, 
-                                             col_filter=col_filter, 
-                                             segmentation_id=segmentation_id,
-                                             color=[0.8, 0.0, 0.0])
-        
-        return marker_id
     
 
 #####################################################################
@@ -210,7 +193,6 @@ def compute_location_observations(root_pos, root_rot, tar_pos):
     # type: (Tensor, Tensor, Tensor) -> Tensor
     heading_rot = torch_util.calc_heading_quat_inv(root_rot)
     local_tar_pos = torch_util.quat_rotate(heading_rot, tar_pos - root_pos)
-    
     obs = local_tar_pos[..., 0:2]
     return obs
 

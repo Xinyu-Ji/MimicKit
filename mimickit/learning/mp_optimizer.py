@@ -7,7 +7,6 @@ class MPOptimizer():
 
     def __init__(self, config, param_list):
         self._param_list = param_list
-        self._grad_list = None
         self._grad_clip = float(config.get("grad_clip", 0.0))
         self._optimizer = self._build_optimizer(config, param_list)
         self._steps = 0
@@ -49,11 +48,11 @@ class MPOptimizer():
     def _build_optimizer(self, config, param_list):
         lr = float(config["learning_rate"])
         weight_decay = float(config.get("weight_decay", 0.0))
-
         optimizer_type = config["type"]
-        if optimizer_type == "SGD":
+
+        if (optimizer_type == "SGD"):
             optimizer = torch.optim.SGD(param_list, lr, momentum=0.9, weight_decay=weight_decay)
-        elif optimizer_type == "Adam":
+        elif (optimizer_type == "Adam"):
             optimizer = torch.optim.AdamW(param_list, lr, weight_decay=weight_decay)
         else:
             assert(False), "Unsupported optimizer type: " + optimizer_type
@@ -79,15 +78,10 @@ class MPOptimizer():
         return synced
 
     def _aggregate_mp_grads(self):
-        if (self._grad_list is None):
-            self._grad_list = [p.grad for p in self._param_list]
-
-        self._param_buffer[:] = torch.nn.utils.parameters_to_vector(self._grad_list)
+        grad_list = [p.grad for p in self._param_list]
+        self._param_buffer[:] = torch.nn.utils.parameters_to_vector(grad_list)
         mp_util.reduce_inplace_mean(self._param_buffer)
-        torch.nn.utils.vector_to_parameters(self._param_buffer, self._grad_list)
-
-        # add a barrier to prevent potential race conditions on some GPUs
-        torch.distributed.barrier()
+        torch.nn.utils.vector_to_parameters(self._param_buffer, grad_list)
         return
     
     def _enable_grad_clip(self):

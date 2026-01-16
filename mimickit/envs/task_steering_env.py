@@ -2,12 +2,12 @@ import torch
 import numpy as np
 
 import envs.amp_env as amp_env
+import engines.engine as engine
 import util.torch_util as torch_util
 
 
 class TaskSteeringEnv(amp_env.AMPEnv):
-    def __init__(self, config, num_envs, device, visualize):
-        env_config = config["env"]
+    def __init__(self, env_config, engine_config, num_envs, device, visualize):
         self._rand_tar_dir = env_config.get("rand_tar_dir", True)
         self._rand_face_dir = env_config.get("rand_face_dir", True)
         self._tar_speed_min = env_config["tar_speed_min"]
@@ -20,8 +20,8 @@ class TaskSteeringEnv(amp_env.AMPEnv):
 
         self._reward_steering_vel_scale = float(env_config["reward_steering_vel_scale"])
 
-        super().__init__(config=config, num_envs=num_envs, device=device, visualize=visualize)
-
+        super().__init__(env_config=env_config, engine_config=engine_config,
+                         num_envs=num_envs, device=device, visualize=visualize)
         return
     
     def _build_envs(self, config, num_envs):
@@ -31,6 +31,46 @@ class TaskSteeringEnv(amp_env.AMPEnv):
 
         super()._build_envs(config, num_envs)
         return
+    
+    def _build_env(self, env_id, config):
+        super()._build_env(env_id, config)
+        
+        if (self._visualize):
+            tar_marker_id, face_marker_id = self._build_markers(env_id)
+
+            if (env_id == 0):
+                self._tar_marker_ids.append(tar_marker_id)
+                self._face_marker_ids.append(face_marker_id)
+            else:
+                tar_marker_id0 = self._tar_marker_ids[0]
+                face_marker_id0 = self._face_marker_ids[0]
+
+                assert(tar_marker_id0 == tar_marker_id)
+                assert(face_marker_id0 == face_marker_id)
+        return
+    
+    def _build_markers(self, env_id):
+        asset_file = "data/assets/objects/steering_marker.xml"
+
+        tar_marker_id = self._engine.create_obj(env_id=env_id, 
+                                             obj_type=engine.ObjType.rigid,
+                                             asset_file=asset_file, 
+                                             name="tar_marker",
+                                             is_visual=True,
+                                             enable_self_collisions=False,
+                                             fix_root=True,
+                                             color=[0.8, 0.0, 0.0])
+
+        face_marker_id = self._engine.create_obj(env_id=env_id, 
+                                             obj_type=engine.ObjType.rigid,
+                                             asset_file=asset_file, 
+                                             name="face_marker",
+                                             is_visual=True,
+                                             enable_self_collisions=False,
+                                             fix_root=True,
+                                             color=[0.0, 0.8, 0.0])
+
+        return tar_marker_id, face_marker_id
 
     def _build_sim_tensors(self, config):
         super()._build_sim_tensors(config)
@@ -44,7 +84,6 @@ class TaskSteeringEnv(amp_env.AMPEnv):
         
         self._tar_dir[..., 0] = 1.0
         self._face_dir[..., 0] = 1.0
-
         return
     
     def _get_tar_marker_id(self):
@@ -100,7 +139,6 @@ class TaskSteeringEnv(amp_env.AMPEnv):
         face_axis[..., -1] = 1.0
         face_marker_rot = torch_util.axis_angle_to_quat(tar_axis, face_theta)
 
-
         self._engine.set_root_pos(env_ids, tar_marker_id, marker_pos)
         self._engine.set_root_rot(env_ids, tar_marker_id, marker_rot)
         self._engine.set_root_vel(env_ids, tar_marker_id, 0.0)
@@ -110,7 +148,6 @@ class TaskSteeringEnv(amp_env.AMPEnv):
         self._engine.set_root_rot(env_ids, face_marker_id, face_marker_rot)
         self._engine.set_root_vel(env_ids, face_marker_id, 0.0)
         self._engine.set_root_ang_vel(env_ids, face_marker_id, 0.0)
-        
         return
     
     def _update_task(self):
@@ -119,12 +156,6 @@ class TaskSteeringEnv(amp_env.AMPEnv):
 
         if len(rest_env_ids) > 0:
             self._reset_task(rest_env_ids)
-            
-        if (self._visualize):
-            num_envs = self._engine.get_num_envs()
-            env_ids = torch.arange(num_envs, device=self._device, dtype=torch.long)
-            self._update_marker(env_ids)
-        
         return
     
     def _reset_envs(self, env_ids):
@@ -135,7 +166,19 @@ class TaskSteeringEnv(amp_env.AMPEnv):
         return
 
     def _reset_task(self, env_ids):
-        n = len(env_ids)
+        self._reset_tar(env_ids)
+
+        n = env_ids.shape[0]
+        rand_dt = torch.rand(n, device=self._device)
+        rand_dt = (self._tar_change_time_max - self._tar_change_time_min) * rand_dt + self._tar_change_time_min
+        self._tar_change_times[env_ids] = self._time_buf[env_ids] + rand_dt
+        
+        if (self._visualize):
+            self._update_marker(env_ids)
+        return
+
+    def _reset_tar(self, env_ids):
+        n = env_ids.shape[0]
 
         if (self._rand_tar_dir):
             rand_theta = 2 * np.pi * torch.rand(n, device=self._device) - np.pi
@@ -151,17 +194,9 @@ class TaskSteeringEnv(amp_env.AMPEnv):
         tar_speed = (self._tar_speed_max - self._tar_speed_min) * torch.rand(n, device=self._device) + self._tar_speed_min
         face_tar_dir = torch.stack([torch.cos(rand_face_theta), torch.sin(rand_face_theta)], dim=-1)
 
-        rand_dt = torch.rand(n, device=self._device)
-        rand_dt = (self._tar_change_time_max - self._tar_change_time_min) * rand_dt + self._tar_change_time_min
-        
         self._tar_speed[env_ids] = tar_speed
         self._tar_dir[env_ids] = tar_dir
         self._face_dir[env_ids] = face_tar_dir
-        self._tar_change_times[env_ids] = self._time_buf[env_ids] + rand_dt
-        
-        if (self._visualize):
-            self._update_marker(env_ids)
-
         return
     
     def _compute_obs(self, env_ids=None):
@@ -205,63 +240,6 @@ class TaskSteeringEnv(amp_env.AMPEnv):
         super()._update_misc()
         self._update_task()
         return
-    
-
-    ######################
-    # Isaac Gym Builders
-    ######################
-    
-    def _ig_load_char_asset(self, config):
-        super()._ig_load_char_asset(config)
-        if (self._visualize):
-            self._ig_load_marker_asset()
-        return
-    
-    def _ig_load_marker_asset(self):
-        asset_file = "data/assets/steering_marker.urdf"
-        self._marker_asset = self._engine.load_asset(asset_file, fix_base=True)
-        return
-    
-    def _ig_build_env(self, env_id, config):
-        super()._ig_build_env(env_id, config)
-        
-        if (self._visualize):
-            tar_marker_id, face_marker_id = self._ig_build_markers(env_id)
-
-            if (env_id == 0):
-                self._tar_marker_ids.append(tar_marker_id)
-                self._face_marker_ids.append(face_marker_id)
-            else:
-                tar_marker_id0 = self._tar_marker_ids[0]
-                face_marker_id0 = self._face_marker_ids[0]
-
-                assert(tar_marker_id0 == tar_marker_id)
-                assert(face_marker_id0 == face_marker_id)
-
-        return
-    
-    def _ig_build_markers(self, env_id):
-        col_group = self.get_num_envs()
-        col_filter = 0
-        segmentation_id = 0
-        
-        tar_marker_id = self._engine.create_actor(env_id=env_id, 
-                                             asset=self._marker_asset, 
-                                             name="tar_marker", 
-                                             col_group=col_group, 
-                                             col_filter=col_filter, 
-                                             segmentation_id=segmentation_id,
-                                             color=[0.8, 0.0, 0.0])
-
-        face_marker_id = self._engine.create_actor(env_id=env_id, 
-                                             asset=self._marker_asset, 
-                                             name="face_marker", 
-                                             col_group=col_group, 
-                                             col_filter=col_filter, 
-                                             segmentation_id=segmentation_id,
-                                             color=[0.0, 0.8, 0.0])
-
-        return tar_marker_id, face_marker_id
 
     
 

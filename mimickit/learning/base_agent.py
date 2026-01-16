@@ -1,6 +1,6 @@
 import abc
 import enum
-import gym.spaces as spaces
+import gymnasium.spaces as spaces
 import numpy as np
 import os
 import time
@@ -24,8 +24,6 @@ class AgentMode(enum.Enum):
     TEST = 1
 
 class BaseAgent(torch.nn.Module):
-    NAME = "base"
-
     def __init__(self, config, env, device):
         super().__init__()
 
@@ -48,14 +46,23 @@ class BaseAgent(torch.nn.Module):
         self._mode = AgentMode.TRAIN
         self._curr_obs = None
         self._curr_info = None
-
         return
 
-    def train_model(self, max_samples, out_model_file, int_output_dir, logger_type, log_file):
+    def train_model(self, max_samples, out_dir, save_int_models, logger_type):
         start_time = time.time()
 
-        self._curr_obs, self._curr_info = self._reset_envs()
+        out_model_file = os.path.join(out_dir, "model.pt")
+        log_file = os.path.join(out_dir, "log.txt")
         self._logger = self._build_logger(logger_type, log_file, self._config)
+
+        if (save_int_models):
+            int_out_dir = os.path.join(out_dir, "int_models")
+            if (mp_util.is_root_proc() and not os.path.exists(int_out_dir)):
+                os.makedirs(int_out_dir, exist_ok=True)
+        else:
+            int_out_dir = ""
+        
+        self._curr_obs, self._curr_info = self._reset_envs()
         self._init_train()
 
         while self._sample_count < max_samples:
@@ -73,7 +80,7 @@ class BaseAgent(torch.nn.Module):
 
             if (output_iter):
                 self._logger.write_log()
-                self._output_train_model(self._iter, out_model_file, int_output_dir)
+                self._output_train_model(self._iter, out_model_file, int_out_dir)
 
                 self._train_return_tracker.reset()
                 self._curr_obs, self._curr_info = self._reset_envs()
@@ -152,7 +159,8 @@ class BaseAgent(torch.nn.Module):
     def _build_normalizers(self):
         obs_space = self._env.get_obs_space()
         obs_dtype = torch_util.numpy_dtype_to_torch(obs_space.dtype)
-        self._obs_norm = normalizer.Normalizer(obs_space.shape, device=self._device, dtype=obs_dtype)
+        self._obs_norm = normalizer.Normalizer(obs_space.shape, clip=10.0, device=self._device, dtype=obs_dtype)
+
         self._a_norm = self._build_action_normalizer()
         return
     
@@ -163,6 +171,10 @@ class BaseAgent(torch.nn.Module):
         if (isinstance(a_space, spaces.Box)):
             a_mean = torch.tensor(0.5 * (a_space.high + a_space.low), device=self._device, dtype=a_dtype)
             a_std = torch.tensor(0.5 * (a_space.high - a_space.low), device=self._device, dtype=a_dtype)
+            
+            # ensure initialized std is strictly greater than 0 to avoid degenerate normalizer
+            assert (a_std > 0).all().item(), "init_std must be > 0 for action normalizer (Box action space wrong! Check your XML file. Joints must have 'limited=true' and non-zero bounds.)"
+
             a_norm = normalizer.Normalizer(a_mean.shape, device=self._device, init_mean=a_mean, 
                                                  init_std=a_std, dtype=a_dtype)
         elif (isinstance(a_space, spaces.Discrete)):
@@ -171,7 +183,8 @@ class BaseAgent(torch.nn.Module):
             a_norm = normalizer.Normalizer(a_mean.shape, device=self._device, init_mean=a_mean, 
                                                  init_std=a_std, min_std=0, dtype=a_dtype)
         else:
-            assert(False), "Unsuppoted action space: {}".format(a_space)
+            assert(False), "Unsupported action space: {}".format(a_space)
+
         return a_norm
 
     def _build_optimizer(self, config):
@@ -190,30 +203,6 @@ class BaseAgent(torch.nn.Module):
         batch_size = self.get_num_envs()
         self._exp_buffer = experience_buffer.ExperienceBuffer(buffer_length=buffer_length, batch_size=batch_size,
                                                               device=self._device)
-        
-        obs_space = self._env.get_obs_space()
-        obs_dtype = torch_util.numpy_dtype_to_torch(obs_space.dtype)
-        obs_buffer = torch.zeros([buffer_length, batch_size] + list(obs_space.shape), device=self._device, dtype=obs_dtype)
-        self._exp_buffer.add_buffer("obs", obs_buffer)
-        
-        next_obs_buffer = torch.zeros_like(obs_buffer)
-        self._exp_buffer.add_buffer("next_obs", next_obs_buffer)
-
-        a_space = self._env.get_action_space()
-        a_dtype = torch_util.numpy_dtype_to_torch(a_space.dtype)
-        a_shape = list(a_space.shape)
-        if (a_shape == []):
-            a_shape = [1]
-
-        action_buffer = torch.zeros([buffer_length, batch_size] + a_shape, device=self._device, dtype=a_dtype)
-        self._exp_buffer.add_buffer("action", action_buffer)
-        
-        reward_buffer = torch.zeros([buffer_length, batch_size], device=self._device, dtype=torch.float)
-        self._exp_buffer.add_buffer("reward", reward_buffer)
-        
-        done_buffer = torch.zeros([buffer_length, batch_size], device=self._device, dtype=torch.int)
-        self._exp_buffer.add_buffer("done", done_buffer)
-
         return
 
     def _build_return_tracker(self):
@@ -236,6 +225,7 @@ class BaseAgent(torch.nn.Module):
         log.set_step_key("Samples")
         if (mp_util.is_root_proc()):
             log.configure_output_file(log_file)
+        
         return log
 
     def _update_sample_count(self):
@@ -288,7 +278,6 @@ class BaseAgent(torch.nn.Module):
             
             self._curr_obs, self._curr_info = self._reset_done_envs(done)
             self._exp_buffer.inc()
-
         return
     
     def _rollout_test(self, num_episodes):
@@ -420,12 +409,20 @@ class BaseAgent(torch.nn.Module):
             if torch.is_tensor(v):
                 v = v.item()
             self._logger.log(val_name, v, collection="2_Env", quiet=True)
-            
+        
+        obs_norm_mean = self._obs_norm.get_mean()
+        obs_norm_std = self._obs_norm.get_std()
+        obs_norm_mean = torch.mean(torch.abs(obs_norm_mean)).item()
+        obs_norm_std = torch.mean(obs_norm_std).item()
+
+        self._logger.log("Obs_Norm_Mean", obs_norm_mean, quiet=True)
+        self._logger.log("Obs_Norm_Std", obs_norm_std, quiet=True)
         return
     
     def _compute_action_bound_loss(self, norm_a_dist):
         loss = None
         action_space = self._env.get_action_space()
+
         if (isinstance(action_space, spaces.Box)):
             a_low = action_space.low
             a_high = action_space.high
@@ -444,10 +441,10 @@ class BaseAgent(torch.nn.Module):
 
         return loss
 
-    def _output_train_model(self, iter, out_model_file, int_output_dir):
+    def _output_train_model(self, iter, out_model_file, int_out_dir):
         self.save(out_model_file)
 
-        if (int_output_dir != ""):
-            int_model_file = os.path.join(int_output_dir, "model_{:010d}.pt".format(iter))
+        if (int_out_dir != ""):
+            int_model_file = os.path.join(int_out_dir, "model_{:010d}.pt".format(iter))
             self.save(int_model_file)
         return
